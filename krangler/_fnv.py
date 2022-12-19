@@ -60,3 +60,11 @@ def ensure_bits_count(number: int, bits: int) -> int:
         int: number with the specified maximum number of bits.
     """
     return number & ((1 << bits) - 1)
+
+def fnv1a64(data) -> int:
+    v = OFFSET_BASIS[64]
+    p = PRIMES[64]
+    m = (1 << 64) - 1
+    for b in data:
+        v = ((v ^ b) * p) & m
+    return v

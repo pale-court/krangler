@@ -1,5 +1,8 @@
+from argparse import ArgumentError
+import cProfile
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from hashlib import sha256
 from io import BytesIO
 import logging
@@ -8,9 +11,10 @@ from pathlib import PurePosixPath
 from stat import FILE_ATTRIBUTE_OFFLINE
 import struct
 from time import sleep
-from typing import List
+from typing import Dict, List
 from atomicwrites import atomic_write
 from rich.progress import track, Progress, MofNCompleteColumn
+import timeit
 
 import zstandard
 
@@ -49,6 +53,14 @@ class FileRecord:
     bundle_index: int
     file_offset: int
     file_size: int
+
+
+@dataclass
+class PathRep:
+    hash: int
+    offset: int
+    size: int
+    recursive_size: int
 
 
 class CompressedBundle:
@@ -99,15 +111,65 @@ class BundleIndex:
             self.files.append(FileRecord(
                 path_hash=path_hash, bundle_index=bundle_index, file_offset=file_offset, file_size=file_size))
 
+        self.path_reps = []
+        path_rep_count, = readf(fh, '<I')
+        for _ in range(path_rep_count):
+            hash, offset, size, recursive_size = readf(fh, '<QIII')
+            self.path_reps.append(
+                PathRep(hash=hash, offset=offset, size=size, recursive_size=recursive_size))
+        self.path_comp = fh.read()
 
-@contextmanager
-def atomic_compressed_ndjson_writer(path):
-    with atomic_write(path, mode='wb', overwrite=True) as ifh:
-        cctx = ZstdCompressor()
-        with cctx.stream_writer(ifh, closefd=False, write_return_read=True) as idx_compressor:
-            with codecs.getwriter('utf-8')(idx_compressor) as codec:
-                yield ndjson.writer(codec)
 
+def _cut_ntmbs(slice):
+    for i, b in enumerate(slice):
+        if b == 0:
+            return slice[:i].tobytes(), slice[i+1:]
+    raise ValueError
+
+
+def _generate_path_hash_table(index: BundleIndex):
+    LOG = logging.getLogger()
+    ret: Dict[int, str] = {}
+
+    path_data = CompressedBundle(BytesIO(index.path_comp)).decompress_all()
+    path_view = memoryview(path_data)
+    running_string_size = 0
+    for rep in index.path_reps:
+        slice = path_view[rep.offset:rep.offset+rep.size]
+        base_phase = False
+        bases = []
+        while len(slice):
+            cmd, = struct.unpack('<I', slice[:4])
+            slice = slice[4:]
+
+            # toggle phase on zero command word
+            if cmd == 0:
+                base_phase = not base_phase
+                if base_phase:
+                    bases.clear()
+                continue
+
+            # otherwise build a base or emit a string
+            s, slice = _cut_ntmbs(slice)
+            if cmd <= len(bases):
+                s = bases[cmd-1] + s.decode('UTF-8')
+            else:
+                s = s.decode('UTF-8')
+
+            if base_phase:
+                bases.append(s)
+            else:
+                running_string_size += len(s)
+                hash = poe_util.hash_file_path(s)
+                ret[hash] = s
+
+    return ret
+
+def _compressable_path(path) -> bool:
+    p = PurePosixPath(path)
+    if p.suffix.lower() in {'.bank', '.bin', '.bk2', '.dll', '.exe', '.ogg', '.png'} or path.startswith('ShaderCache'):
+        return False
+    return True
 
 def ingest_bundled(paths: Paths, depot: int, manifest: int):
     LOG = logging.getLogger()
@@ -133,10 +195,6 @@ def ingest_bundled(paths: Paths, depot: int, manifest: int):
 
     index = BundleIndex(index_file_path)
 
-    # Generate and hash paths from inner structure.
-    path_by_phash = {}
-    pass
-
     # Sort file list to traverse in bundle and offset order.
     l2: List[FileRecord] = sorted(index.files, key=lambda f: (
         f.bundle_index, f.file_offset, f.file_size))
@@ -153,16 +211,17 @@ def ingest_bundled(paths: Paths, depot: int, manifest: int):
             except:
                 pass
 
-    with atomic_compressed_ndjson_writer(paths.bundled_index_path(depot, manifest)) as index_writer:
+    with poe_util.atomic_compressed_ndjson_writer(paths.bundled_index_path(depot, manifest)) as index_writer:
         with BundledExtentMap(paths.bundled_extent_db()) as bem:
+            populated_path_cache = False
             bid = None
             brec = None
             bhash_bin = None
             bhash_hex = None
             bdata = None
             with Progress(*Progress.get_default_columns(), MofNCompleteColumn(), refresh_per_second=1) as progress:
-                ttask = progress.add_task('Total entries...', total=len(l2))
-                btask = progress.add_task('Bundles...', total=len(index.bundles))
+                ttask = progress.add_task('Total entries', total=len(l2))
+                btask = progress.add_task('Bundles', total=len(index.bundles))
 
                 new_bem_keys = []
                 new_bem_values = []
@@ -173,6 +232,17 @@ def ingest_bundled(paths: Paths, depot: int, manifest: int):
                     bdata = None
 
                     for frec in frecs:
+                        path = bem.get_path(frec.path_hash)
+                        if not path and not populated_path_cache:
+                            ctask = progress.add_task('Caching paths', total=1)
+                            # Generate and hash paths from inner structure.
+                            path_by_phash = _generate_path_hash_table(index)
+                            populated_path_cache = True
+                            bem.set_paths(path_by_phash.items())
+                            del path_by_phash
+                            progress.remove_task(ctask)
+                            path = bem.get_path(frec.path_hash)
+                        should_compress = _compressable_path(path)
                         if fhash_bin := bem.get_extent_hash(bhash_bin, frec.file_offset, frec.file_size):
                             fhash_hex = fhash_bin.hex()
                         else:
@@ -186,12 +256,13 @@ def ingest_bundled(paths: Paths, depot: int, manifest: int):
                             fhash_bin = sha256(slice).digest()
                             fhash_hex = fhash_bin.hex()
                             if fhash_bin not in hashes_on_disk:
-                                fpath = paths.bundled_data_path(fhash_hex)
+                                fpath = paths.bundled_data_path(fhash_hex, compressed=should_compress)
                                 if not fpath.exists():
                                     with atomic_write(fpath, mode='wb', overwrite=True) as fh:
                                         bcctx = ZstdCompressor()
                                         for chunk in bcctx.read_to_iter(slice):
                                             fh.write(chunk)
+                                    fpath.chmod(0o644)
                             new_bem_keys.append(
                                 (bhash_bin, frec.file_offset, frec.file_size))
                             new_bem_values.append(fhash_bin)
@@ -199,9 +270,10 @@ def ingest_bundled(paths: Paths, depot: int, manifest: int):
                         # write an index entry
                         nd = {
                             'sha256': fhash_hex,
-                            # 'path': path_by_phash[frec.path_hash],
+                            'path': path,
+                            'phash': str(frec.path_hash),
                             'size': frec.file_size,
-                            'comp': True,
+                            'comp': should_compress,
                         }
                         index_writer.writerow(nd)
 
@@ -209,111 +281,3 @@ def ingest_bundled(paths: Paths, depot: int, manifest: int):
 
                 if len(new_bem_keys):
                     bem.set_extent_hashes(new_bem_keys, new_bem_values)
-
-
-'''
-    bundled_extent_map.build_db(paths.bundled_extent_db())
-
-    EXTENT_MAP_COMMIT_THRESHOLD = 1000
-    ingested_files = 0
-    engine = create_engine(paths.bundled_extent_db(), echo=False, future=True)
-    with Session(engine) as session:
-        bhash_by_bid = []
-        our_bundle_hashes = {}
-        for brec in index.bundles:
-            bsha256 = bundle_by_path[str(brec.bin_path())]["sha256"]
-            bhash_by_bid.append(bsh256)
-            our_bundle_hashes[bsha256] = None
-
-        bundle_hashes = {}
-        for bh in session.query(BundleHash).all():
-            if bh.hash in our_bundle_hashes:
-                bundle_hashes[bh.hash] = bh.id
-                del our_bundle_hashes[bh.hash]
-
-        for hash in our_bundle_hashes:
-            bobj = BundleHash(hash=hash)
-            session.add(bobj)
-            bundle_hashes[hash] = bobj.id
-
-        session.flush()
-
-        with atomic_write(paths.bundled_index_path(depot, manifest), mode='wb', overwrite=True) as ifh:
-            cctx = ZstdCompressor()
-            with cctx.stream_writer(ifh, closefd=False, write_return_read=True) as idx_compressor:
-                with codecs.getwriter('utf-8')(idx_compressor) as codec:
-                    index_writer = ndjson.writer(codec)
-
-                    for brec in index.bundles:
-
-                    brec: BundleRecord = None
-                    bdata = None
-                    bhash_row = None
-                    # for each bundled file entry (sorted for extraction synergy):
-                    for bid, frecs in track(bundle_extents.items(), description="Unbundling files"):
-                        brec = index.bundles[bid]
-                        bdata = None
-
-                    """
-                    for frec_idx, frec in enumerate(track(l2, description="Unbundling files")):
-                        if brec is None or bid != frec.bundle_index:
-                            bid = frec.bundle_index
-                            brec = index.bundles[bid]
-                            bsha256 = bundle_by_path[str(
-                                brec.bin_path())]["sha256"]
-                            bdata = None
-                            if row := session.query(BundleHash).filter_by(hash=bsha256).one_or_none():
-                                bhash_id = row.id
-                            else:
-                                bhash_id = BundleHash(hash=bsha256).id
-                        # look up the extent and the bundle hash to determine if the file doesn't need to be extracted;
-                        if shortcut := session.execute(select(ExtentMap).
-                                                       filter_by(bundle_hash_id=bhash_id, file_offset=frec.file_offset, file_size=frec.file_size)
-                                                       # .filter(ExtentMap.bundle_hash.has(hash=bsha256))
-                                                       ).scalar_one_or_none():
-                            fsha256 = shortcut.file_hash.hash
-                        else:
-                            # extract and record the bundled hash in the output
-                            if not bdata:
-                                bdata = CompressedBundle(paths.loose_data_path(
-                                    bsha256).open('rb')).decompress_all()
-                            start = frec.file_offset
-                            end = start + frec.file_size
-                            slice = memoryview(bdata)[start:end]
-                            fsha256 = sha256(slice).hexdigest()
-                            bpath = paths.bundled_data_path(fsha256)
-                            if not bpath.exists():
-                                with atomic_write(bpath, mode='wb', overwrite=True) as fh:
-                                    bcctx = ZstdCompressor()
-                                    for chunk in bcctx.read_to_iter(slice):
-                                        fh.write(chunk)
-                            row = ExtentMap(
-                                file_offset=frec.file_offset, file_size=frec.file_size)
-                            row.bundle_hash = bhash_row
-                            if fhash_row := session.query(FileHash).filter_by(hash=fsha256).one_or_none():
-                                row.file_hash = fhash_row
-                            else:
-                                row.file_hash = FileHash(hash=fsha256)
-                            session.add(row)
-                            session.flush()
-
-                        ingested_files += 1
-                        if ingested_files == EXTENT_MAP_COMMIT_THRESHOLD:
-                            # session.commit()
-                            ingested_files = 0
-
-                        # write an index for bundled files
-                        nd = {
-                            'sha256': fsha256,
-                            # 'path': path_by_phash[frec.path_hash],
-                            'size': frec.file_size,
-                            'comp': True,
-                        }
-                        try:
-                            index_writer.writerow(nd)
-                        except Exception as e:
-                            print(cctx.frame_progression())
-                            raise e
-                    """
-        session.commit()
-'''
