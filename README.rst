@@ -14,6 +14,7 @@ Required environment variables:
   from;
 * ``STEAM_USER``: Steam user to download data files with;
 * ``STEAM_PASSWORD``: password for Steam user;
+* ``STEAM_ID_BASE``: base offset for Steam login IDs to allow concurrent logins;
 * ``MOLLY_GUARD``: secret password for mutable changeapi access.
 
 This tool preferably runs as a timer polling for new work and exiting when

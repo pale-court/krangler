@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     remote_zip_dir: Path = None
     steam_user: str
     steam_password: str
+    steam_id_base: int
     molly_guard: str
 
 
@@ -106,7 +107,7 @@ def download_depot(tracker, depot, manifest):
             '-username', settings.steam_user,
             '-remember-password',
             '-password', settings.steam_password,
-            '-loginid', depot,
+            '-loginid', settings.steam_id_base + depot - 238000,
             '-dir', dl_dir,
             '-manifest', manifest]()
         current_scratch_manifests[depot] = manifest
@@ -147,7 +148,7 @@ def download_zip(tracker, depot, manifest):
             '-username', settings.steam_user,
             '-remember-password',
             '-password', settings.steam_password,
-            '-loginid', depot,
+            '-loginid', settings.steam_id_base + depot - 238000,
             '-dir', dl_dir,
             '-manifest', manifest]()
 
