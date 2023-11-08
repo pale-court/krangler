@@ -1,7 +1,7 @@
 from argparse import ArgumentError
 import cProfile
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from hashlib import sha256
 from io import BytesIO
@@ -11,12 +11,10 @@ from pathlib import PurePosixPath
 from stat import FILE_ATTRIBUTE_OFFLINE
 import struct
 from time import sleep
-from typing import Dict, List
+from typing import Dict, List, Optional
 from atomicwrites import atomic_write
 from rich.progress import track, Progress, MofNCompleteColumn
 import timeit
-
-import zstandard
 
 from krangler import poe_util
 from .paths import Paths
@@ -25,7 +23,7 @@ import ndjson
 
 import codecs
 import ooz
-from zstandard import ZstdCompressor, ZstdDecompressor
+from zstandard import ZstdDecompressor
 
 from .bundled_extent_map import BundledExtentMap
 
@@ -127,49 +125,79 @@ def _cut_ntmbs(slice):
     raise ValueError
 
 
+@dataclass
+class PathHashTable:
+    path_by_ihash: Dict[int, str] = field(default_factory=dict)
+    ohash_by_ihash: Dict[int, int] = field(default_factory=dict)
+
+    ihasher: poe_util.PathHasher = None
+    ohasher: Optional[poe_util.PathHasher] = None
+
+def _generate_paths(rep, path_view, recurse = False):
+    slice_end = rep.offset + (rep.recursive_size if recurse else rep.size)
+    slice = path_view[rep.offset:slice_end]
+    base_phase = False
+    bases = []
+    while len(slice):
+        cmd, = struct.unpack('<I', slice[:4])
+        slice = slice[4:]
+
+        # toggle phase on zero command word
+        if cmd == 0:
+            base_phase = not base_phase
+            if base_phase:
+                bases.clear()
+            continue
+
+        # otherwise build a base or emit a string
+        s, slice = _cut_ntmbs(slice)
+        if cmd <= len(bases):
+            s = bases[cmd-1] + s.decode('UTF-8')
+        else:
+            s = s.decode('UTF-8')
+
+        if base_phase:
+            bases.append(s)
+        else:
+            yield s
+
+
 def _generate_path_hash_table(index: BundleIndex):
     LOG = logging.getLogger()
-    ret: Dict[int, str] = {}
+    ret = PathHashTable()
 
     path_data = CompressedBundle(BytesIO(index.path_comp)).decompress_all()
     path_view = memoryview(path_data)
-    running_string_size = 0
+
+    rep_hashes = list(map(lambda x: x.hash, index.path_reps))
+
+    legacy_hasher = poe_util.PoE_3_11_2_Hash()
+    modern_hasher = poe_util.PoE_3_21_2_Hash()
+
+    if legacy_hasher.hash_dir_path('Art') in rep_hashes:
+        ret.ihasher = legacy_hasher
+        ret.ohasher = modern_hasher
+    elif modern_hasher.hash_dir_path('Art') in rep_hashes:
+        ret.ihasher = modern_hasher
+    else:
+        raise RuntimeError("Unknown root hash algorithm/seed")
+
     for rep in index.path_reps:
-        slice = path_view[rep.offset:rep.offset+rep.size]
-        base_phase = False
-        bases = []
-        while len(slice):
-            cmd, = struct.unpack('<I', slice[:4])
-            slice = slice[4:]
-
-            # toggle phase on zero command word
-            if cmd == 0:
-                base_phase = not base_phase
-                if base_phase:
-                    bases.clear()
-                continue
-
-            # otherwise build a base or emit a string
-            s, slice = _cut_ntmbs(slice)
-            if cmd <= len(bases):
-                s = bases[cmd-1] + s.decode('UTF-8')
-            else:
-                s = s.decode('UTF-8')
-
-            if base_phase:
-                bases.append(s)
-            else:
-                running_string_size += len(s)
-                hash = poe_util.hash_file_path(s)
-                ret[hash] = s
+        for s in _generate_paths(rep, path_view):
+            ihash = ret.ihasher.hash_file_path(s)
+            ohash = ret.ohasher.hash_file_path(s) if ret.ohasher else ihash
+            ret.path_by_ihash[ihash] = s
+            ret.ohash_by_ihash[ihash] = ohash
 
     return ret
 
 def _compressable_path(path) -> bool:
+    return False
     p = PurePosixPath(path)
     if p.suffix.lower() in {'.bank', '.bin', '.bk2', '.dll', '.exe', '.ogg', '.png'} or path.startswith('ShaderCache'):
         return False
     return True
+
 
 def ingest_bundled(paths: Paths, depot: int, manifest: int):
     LOG = logging.getLogger()
@@ -177,7 +205,7 @@ def ingest_bundled(paths: Paths, depot: int, manifest: int):
     # grab the NDJSON with the loose files to find the index and bundle files
     index_file_path = None
     bundle_by_path = {}
-    bundle_by_phash = {}
+    bundle_by_ohash = {}
     with paths.loose_index_path(depot, manifest).open('rb') as zfh:
         zctx = ZstdDecompressor()
         with zctx.stream_reader(zfh) as fh:
@@ -188,7 +216,7 @@ def ingest_bundled(paths: Paths, depot: int, manifest: int):
                         index_file_path = paths.loose_data_path(row['sha256'])
                     elif row['path'].endswith('.bundle.bin'):
                         bundle_by_path[row['path']] = row
-                        bundle_by_phash[int(row['phash'])] = row
+                        bundle_by_ohash[int(row['phash'])] = row
 
     if not index_file_path:
         return
@@ -211,73 +239,65 @@ def ingest_bundled(paths: Paths, depot: int, manifest: int):
             except:
                 pass
 
-    with poe_util.atomic_compressed_ndjson_writer(paths.bundled_index_path(depot, manifest)) as index_writer:
-        with BundledExtentMap(paths.bundled_extent_db()) as bem:
-            populated_path_cache = False
-            bid = None
-            brec = None
-            bhash_bin = None
-            bhash_hex = None
+    with (
+        poe_util.atomic_compressed_ndjson_writer(paths.bundled_index_path(depot, manifest)) as index_writer,
+        BundledExtentMap(paths.bundled_extent_db()) as bem,
+        Progress(*Progress.get_default_columns(), MofNCompleteColumn(), refresh_per_second=1) as progress,
+        poe_util.BatchWriter(10000, 128 * 2**20) as batch_writer,
+    ):
+        bid = None
+        brec = None
+        bhash_bin = None
+        bhash_hex = None
+        bdata = None
+
+        ttask = progress.add_task('Total entries', total=len(l2))
+        btask = progress.add_task('Bundles', total=len(index.bundles))
+
+        ctask = progress.add_task('Caching paths', total=1)
+        # Generate and hash paths from inner structure.
+        path_hashes = _generate_path_hash_table(index)
+        progress.remove_task(ctask)
+
+        new_bem_keys = []
+        new_bem_values = []
+        for bid, frecs in enumerate(l2b):
+            brec = index.bundles[bid]
+            bhash_hex = bundle_by_path[str(brec.bin_path())]["sha256"]
+            bhash_bin = bytes.fromhex(bhash_hex)
             bdata = None
-            with Progress(*Progress.get_default_columns(), MofNCompleteColumn(), refresh_per_second=1) as progress:
-                ttask = progress.add_task('Total entries', total=len(l2))
-                btask = progress.add_task('Bundles', total=len(index.bundles))
 
-                new_bem_keys = []
-                new_bem_values = []
-                for bid, frecs in enumerate(l2b):
-                    brec = index.bundles[bid]
-                    bhash_hex = bundle_by_path[str(brec.bin_path())]["sha256"]
-                    bhash_bin = bytes.fromhex(bhash_hex)
-                    bdata = None
+            for frec in frecs:
+                path = path_hashes.path_by_ihash[frec.path_hash]
+                if fhash_bin := bem.get_extent_hash(bhash_bin, frec.file_offset, frec.file_size):
+                    fhash_hex = fhash_bin.hex()
+                else:
+                    # extract and record the bundled hash in the output
+                    if not bdata:
+                        bdata = CompressedBundle(paths.loose_data_path(
+                            bhash_hex).open('rb')).decompress_all()
+                    start = frec.file_offset
+                    end = start + frec.file_size
+                    slice = memoryview(bdata)[start:end]
+                    fhash_bin = sha256(slice).digest()
+                    fhash_hex = fhash_bin.hex()
+                    if fhash_bin not in hashes_on_disk:
+                        fpath = paths.bundled_data_path(fhash_hex, compressed=False)
+                        batch_writer.put(fpath, slice)
+                    new_bem_keys.append(
+                        (bhash_bin, frec.file_offset, frec.file_size))
+                    new_bem_values.append(fhash_bin)
+                progress.update(ttask, advance=1)
+                # write an index entry
+                nd = {
+                    'sha256': fhash_hex,
+                    'path': path,
+                    'phash': path_hashes.ohash_by_ihash[frec.path_hash],
+                    'size': frec.file_size,
+                }
+                index_writer.writerow(nd)
 
-                    for frec in frecs:
-                        path = bem.get_path(frec.path_hash)
-                        if not path and not populated_path_cache:
-                            ctask = progress.add_task('Caching paths', total=1)
-                            # Generate and hash paths from inner structure.
-                            path_by_phash = _generate_path_hash_table(index)
-                            populated_path_cache = True
-                            bem.set_paths(path_by_phash.items())
-                            del path_by_phash
-                            progress.remove_task(ctask)
-                            path = bem.get_path(frec.path_hash)
-                        should_compress = _compressable_path(path)
-                        if fhash_bin := bem.get_extent_hash(bhash_bin, frec.file_offset, frec.file_size):
-                            fhash_hex = fhash_bin.hex()
-                        else:
-                            # extract and record the bundled hash in the output
-                            if not bdata:
-                                bdata = CompressedBundle(paths.loose_data_path(
-                                    bhash_hex).open('rb')).decompress_all()
-                            start = frec.file_offset
-                            end = start + frec.file_size
-                            slice = memoryview(bdata)[start:end]
-                            fhash_bin = sha256(slice).digest()
-                            fhash_hex = fhash_bin.hex()
-                            if fhash_bin not in hashes_on_disk:
-                                fpath = paths.bundled_data_path(fhash_hex, compressed=should_compress)
-                                if not fpath.exists():
-                                    with atomic_write(fpath, mode='wb', overwrite=True) as fh:
-                                        bcctx = ZstdCompressor()
-                                        for chunk in bcctx.read_to_iter(slice):
-                                            fh.write(chunk)
-                                    fpath.chmod(0o644)
-                            new_bem_keys.append(
-                                (bhash_bin, frec.file_offset, frec.file_size))
-                            new_bem_values.append(fhash_bin)
-                        progress.update(ttask, advance=1)
-                        # write an index entry
-                        nd = {
-                            'sha256': fhash_hex,
-                            'path': path,
-                            'phash': str(frec.path_hash),
-                            'size': frec.file_size,
-                            'comp': should_compress,
-                        }
-                        index_writer.writerow(nd)
+            progress.update(btask, advance=1)
 
-                    progress.update(btask, advance=1)
-
-                if len(new_bem_keys):
-                    bem.set_extent_hashes(new_bem_keys, new_bem_values)
+        if len(new_bem_keys):
+            bem.set_extent_hashes(new_bem_keys, new_bem_values)
