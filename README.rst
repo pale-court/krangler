@@ -20,6 +20,7 @@ Required environment variables:
 * ``ALLOW_ZIPPING``: indicates if new data should be archived for eventual reprocessing;
 * ``STEAM_USER``: Steam user to download data files with;
 * ``STEAM_PASSWORD``: password for Steam user;
+* ``STEAM_ID_BASE``: base offset for Steam login IDs to allow concurrent logins;
 * ``MOLLY_GUARD``: secret password for mutable changeapi access.
 
 
