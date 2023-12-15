@@ -1,9 +1,10 @@
 import struct
 import sys
-from contextlib import contextmanager
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
+from typing import List
+
 from krangler.ggpk import PackSource
 from atomicwrites import atomic_write
 from zstandard import ZstdCompressor
@@ -30,6 +31,12 @@ class DataPile:
     def has_one(self, sha256: bytes) -> bool:
         return self._item_path(sha256).exists()
 
+    def has_many(self, sha256s: List[bytes]) -> List[bool]:
+        ret = []
+        for sha256 in sha256s:
+            ret.append(self.has_one(sha256))
+        return ret
+
     def write_one(self, sha256: bytes, payload: bytes):
         p = self._item_path(sha256)
         try:
@@ -41,13 +48,21 @@ class DataPile:
 
 def decompose_ggpk(pack: PackSource, pile: DataPile) -> DecomposedPack:
     # Store data payload on pile
-    for file_offset in pack.files:
+    all_offsets = list(pack.files.keys())
+    all_hashes = []
+    for file_offset in all_offsets:
+        file_chunk = pack.files[file_offset]
+        all_hashes.append(file_chunk.sha256)
+
+    all_exists = pile.has_many(all_hashes)
+
+    for i in [i for i, exists in enumerate(all_exists) if exists is False]:
+        file_offset = all_offsets[i]
         file_chunk = pack.files[file_offset]
         file_path = pack.file_path(file_offset)
         if file_path is not None:
-            if not pile.has_one(file_chunk.sha256):
-                file_data = pack.file_data(file_offset)
-                pile.write_one(file_chunk.sha256, file_data)
+            file_data = pack.file_data(file_offset)
+            pile.write_one(file_chunk.sha256, file_data)
 
     # Generate dense skeleton file
     skeleton = BytesIO()
