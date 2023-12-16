@@ -125,6 +125,9 @@ def main() -> int:
     skel_path = out_path / f'Content-{gid}.ggpk-skeleton'
     free_path = out_path / f'Content-{gid}.ggpk-free'
 
+    if skel_path.exists() and free_path.exists():
+        return 0
+
     with source_path.open(mode='rb') as pack_fh:
         pack = PackSource(pack_fh)
         pile = DataPile(pile_path)
