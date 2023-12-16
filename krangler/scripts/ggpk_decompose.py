@@ -117,24 +117,26 @@ def decompose_ggpk(pack: PackSource, pile: DataPile) -> DecomposedPack:
     return DecomposedPack(skeleton=skeleton.getvalue(), free_list=free_list.getvalue())
 
 
-def main():
+def main() -> int:
     source_path = Path(sys.argv[1])
     pile_path = Path(sys.argv[2])
     out_path = Path(sys.argv[3])
     gid = sys.argv[4]
+    skel_path = out_path / f'Content-{gid}.ggpk-skeleton'
+    free_path = out_path / f'Content-{gid}.ggpk-free'
+
     with source_path.open(mode='rb') as pack_fh:
         pack = PackSource(pack_fh)
         pile = DataPile(pile_path)
         dp = decompose_ggpk(pack, pile)
         print(f"{len(dp.skeleton)=}, {len(dp.free_list)=}")
-        skel_path = out_path / f'Content-{gid}.ggpk-skeleton'
-        free_path = out_path / f'Content-{gid}.ggpk-free'
-        with (
-            atomic_write(skel_path, mode='wb') as sfh,
-            atomic_write(free_path, mode='wb') as ffh,
-        ):
-            sfh.write(dp.skeleton)
-            ffh.write(dp.free_list)
+        for path, data in [(skel_path, dp.skeleton), (free_path, dp.free_list)]:
+            if not path.exists():
+                try:
+                    with atomic_write(path, mode='wb') as sfh:
+                        sfh.write(data)
+                except (FileExistsError, PermissionError) as e:
+                    pass
 
 
 if __name__ == "__main__":
