@@ -63,18 +63,21 @@ class PackSource(source.Source):
             if tag == _PDIR_TAG:
                 if pack_offset in (child0, child1):
                     self.root_offset = pack_offset
-                name_len, child_count = struct.unpack('<II', fh.read(8))
-                sha256 = fh.read(32)
+                buf = fh.read(8 + 32)
+                name_len, child_count = struct.unpack('<II', buf[:8])
+                sha256 = buf[8:]
                 name = fh.read(name_len * 2)[:-2].decode('UTF-16LE')
                 children = []
-                for _ in range(child_count):
-                    name_hash, child_offset = struct.unpack('<IQ', fh.read(12))
+                buf = fh.read(12 * child_count)
+                for i in range(child_count):
+                    name_hash, child_offset = struct.unpack('<IQ', buf[12*i:12*(i+1)])
                     children.append(child_offset)
                     self.parents[child_offset] = pack_offset
                 self.dirs[pack_offset] = PackDir(rec_len=rec_len, tag=tag, name=name, sha256=sha256, children=children)
             elif tag == _FILE_TAG:
-                name_len, = struct.unpack('<I', fh.read(4))
-                sha256 = fh.read(32)
+                buf = fh.read(4 + 32)
+                name_len, = struct.unpack('<I', buf[:4])
+                sha256 = buf[4:]
                 name = fh.read(name_len * 2)[:-2].decode('UTF-16LE')
                 data_offset = fh.tell()
                 data_size = rec_len - (data_offset - pack_offset)
