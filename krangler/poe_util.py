@@ -55,14 +55,20 @@ class PoE_3_21_2_Hash(PathHasher):
         s = p.lower().encode('UTF-8')
         return murmur.murmur2_64a(s, self.seed)
 
+@contextmanager
+def compressed_ndjson_writer(ifh):
+    cctx = ZstdCompressor()
+    with cctx.stream_writer(ifh, closefd=False, write_return_read=True) as idx_compressor:
+        with codecs.getwriter('utf-8')(idx_compressor) as codec:
+            yield ndjson.writer(codec)
 
 @contextmanager
 def atomic_compressed_ndjson_writer(path):
-    with atomic_write(path, mode='wb', overwrite=True) as ifh:
-        cctx = ZstdCompressor()
-        with cctx.stream_writer(ifh, closefd=False, write_return_read=True) as idx_compressor:
-            with codecs.getwriter('utf-8')(idx_compressor) as codec:
-                yield ndjson.writer(codec)
+    with (
+        atomic_write(path, mode='wb', overwrite=True) as ifh,
+        compressed_ndjson_writer(ifh) as writer,
+    ):
+        yield writer
     path.chmod(0o644)
 
 

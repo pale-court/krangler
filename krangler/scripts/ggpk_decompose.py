@@ -8,42 +8,13 @@ from typing import List
 from atomicwrites import atomic_write
 from zstandard import ZstdCompressor
 
+from krangler.data_pile import DataPile
 from krangler.ggpk import PackSource
 
 
 @dataclass
 class DecomposedPack:
     pass
-
-
-class DataPile:
-    def __init__(self, root: Path):
-        self.root = root
-        if not root.exists():
-            root.mkdir(parents=True, exist_ok=True)
-        for group in range(256):
-            (root / f'{group:02x}').mkdir(exist_ok=True)
-
-    def _item_path(self, sha256: bytes) -> Path:
-        hash_hex = sha256.hex()
-        return self.root / hash_hex[:2] / f'{hash_hex}.bin'
-
-    def has_one(self, sha256: bytes) -> bool:
-        return self._item_path(sha256).exists()
-
-    def has_many(self, sha256s: List[bytes]) -> List[bool]:
-        ret = []
-        for sha256 in sha256s:
-            ret.append(self.has_one(sha256))
-        return ret
-
-    def write_one(self, sha256: bytes, payload: bytes):
-        p = self._item_path(sha256)
-        try:
-            with atomic_write(p, mode='wb', overwrite=False) as writer:
-                writer.write(payload)
-        except (FileExistsError, PermissionError) as e:
-            pass
 
 
 def decompose_ggpk(pack: PackSource, pile: DataPile, skel_file, free_file) -> DecomposedPack:
@@ -69,23 +40,22 @@ def decompose_ggpk(pack: PackSource, pile: DataPile, skel_file, free_file) -> De
     if skel_file:
         print("Generating skeleton file")
         # Write skeleton header
-        rec_len = 4 + 4 + 4 + len(pack.ggpk)
-        skel_file.write(struct.pack(f'<I4sI{len(pack.ggpk)}s', rec_len, b'GGSK', 1, pack.ggpk))
+        rec_len = (4 + 4 + 4) + len(pack.ggpk)
+        skel_file.write(struct.pack(f'<I4sI{len(pack.ggpk)}s', rec_len, b'GGSK', 2, pack.ggpk))
         write_offset = rec_len
 
         # Write offset list
         dir_count = len(pack.dirs)
         file_count = len(pack.files)
-        rec_len = 4 + 4 + 4 + 4 + dir_count * (8 + 8) + file_count * (8 + 8)
+        rec_len = (4 + 4 + 4 + 4) + dir_count * (8 + 8) + file_count * (8 + 8)
         write_offset += rec_len
-        data_start = write_offset
         skel_file.write(struct.pack('<I4sII', rec_len, b'OFFS', dir_count, file_count))
         for dir_offset, chunk in pack.dirs.items():
             skel_file.write(struct.pack('<QQ', write_offset, dir_offset))
             write_offset += chunk.rec_len
         for file_offset, chunk in pack.files.items():
             skel_file.write(struct.pack('<QQ', write_offset, file_offset))
-            write_offset += chunk.rec_len
+            write_offset += chunk.rec_len - chunk.data_size
 
         # Write entries
         for offset, chunk in pack.dirs.items():
@@ -100,13 +70,13 @@ def decompose_ggpk(pack: PackSource, pile: DataPile, skel_file, free_file) -> De
         with zctx.stream_writer(free_file, closefd=False) as writer:
             free_index: dict[int, int] = {}
 
-            header_size = 4 + 4 + 4 + len(pack.frees) * (8 + 8)
+            header_size = (4 + 4 + 4 + 4) + len(pack.frees) * (8 + 8)
             print(f'{len(pack.frees)=}, {header_size=}')
             write_offset = header_size
             for free_offset, chunk in pack.frees.items():
                 free_index[write_offset] = free_offset
                 write_offset += chunk.rec_len
-            writer.write(struct.pack('<I4sII', header_size, b'GGFR', 1, len(free_index)))
+            writer.write(struct.pack('<I4sII', header_size, b'GGFR', 2, len(free_index)))
             for here, there in free_index.items():
                 writer.write(struct.pack('<QQ', here, there))
 
