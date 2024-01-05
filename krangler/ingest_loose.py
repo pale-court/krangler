@@ -74,9 +74,10 @@ class ManifestLookups:
 
 def try_open_depot_manifest(source: source.Source, paths: Paths, depot, manifest):
     origins = {
-        "disk": lambda filename: open(paths.separate_manifest_path() / filename, "rb"),
         "source": lambda filename: source.open(f".DepotDownloader/{filename}"),
     }
+    if paths.separate_manifest_path():
+        origins["disk"] =  lambda filename: open(paths.separate_manifest_path() / filename, "rb")
     steam_manifest_cands = [
         f"{depot}_{manifest}.bin",
         f"{manifest}.bin",

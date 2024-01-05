@@ -1,6 +1,7 @@
 import csv
 import os
 import sys
+from typing import Optional
 import zipfile
 import zlib
 from pathlib import Path, PurePath, PurePosixPath
@@ -29,18 +30,18 @@ class Settings(BaseSettings):
     api_url: AnyHttpUrl
     appinfo_dir: Path
     root_dir: Path
-    depot_downloader: Path = None
-    cached_bundle_dir: Path = None
-    cached_pack_dir: Path = None
-    cached_zip_dir: Path = None
-    separate_manifest_dir: Path = None
-    allow_downloads: bool = True
-    allow_zipping: bool = False
-    data_db_uri: str = None
     steam_user: str
     steam_password: str
     steam_id_base: int
     molly_guard: str
+    depot_downloader: Optional[Path] = None
+    cached_bundle_dir: Optional[Path] = None
+    cached_pack_dir: Optional[Path] = None
+    cached_zip_dir: Optional[Path] = None
+    separate_manifest_dir: Optional[Path] = None
+    allow_downloads: bool = True
+    allow_zipping: bool = False
+    data_db_uri: Optional[str] = None
 
 
 settings = Settings()
