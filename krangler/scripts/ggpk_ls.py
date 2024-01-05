@@ -9,6 +9,5 @@ def main():
     for offset in source.files:
         if (path := source.file_path(offset)):
             path = PurePosixPath(path)
-            path = path.relative_to('/')
             info = source.files[offset]
             print(path, info.sha256.hex(), info.data_size)

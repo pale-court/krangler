@@ -124,10 +124,12 @@ class PackSource(source.Source):
         file = self.files[offset]
         segments = [file.name]
         dir_offset = None
-        while dir_offset != self.root_offset:
+        while True:
             dir_offset = self.parents.get(offset)
             if dir_offset is None:
                 return None
+            if dir_offset == self.root_offset:
+                break
             dir = self.dirs[dir_offset]
             segments.append(dir.name)
             offset = dir_offset
