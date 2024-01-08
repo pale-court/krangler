@@ -18,6 +18,7 @@ from krangler.bundled_extent_map import BundledExtentMap
 from krangler.logging import LOG
 from krangler.protos import depot_downloader_pb2
 from krangler.source import open_source
+from krangler.upload import upload_appinfos
 from .ingest_bundled import ingest_bundled
 from .ingest_loose import ingest_source
 from .paths import Paths
@@ -319,7 +320,11 @@ def probe_depot_cache(depot, manifest):
 
 
 def main():
-    # upload_appinfos()
+    upload_appinfos(
+        api_url=settings.api_url,
+        appinfo_dir=settings.appinfo_dir,
+        molly_guard=settings.molly_guard,
+    )
     depots = fetch_depot_manifest_gids()
 
     depots = sorted(depots.items(), key=lambda x: int(x[0]), reverse=False)
