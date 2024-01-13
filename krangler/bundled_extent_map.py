@@ -17,9 +17,10 @@ def _unpack_extent_hash_key(key) -> Tuple[bytes, int, int]:
 
 class BundledExtentMap:
     def __init__(self, path: str | Path):
-        self.env = lmdb.open(str(path), max_dbs=3, map_size=2**39)
+        self.env = lmdb.open(str(path), max_dbs=4, map_size=2**39)
         self.emdb = self.env.open_db(b'_emdb')
         self.pathdb = self.env.open_db(b'_pathdb')
+        self.sha1db = self.env.open_db(b'_sha1db')
 
     def __enter__(self):
         return self
@@ -32,6 +33,9 @@ class BundledExtentMap:
 
     def pathtxn(self, **kwargs):
         return self.env.begin(db=self.pathdb, **kwargs)
+    
+    def sha1txn(self, **kwargs):
+        return self.env.begin(db=self.sha1db, **kwargs)
 
     def get_extent_hash(self, bundle_hash, file_offset, file_size) -> Optional[bytes]:
         with self.emtxn() as txn:
@@ -81,8 +85,20 @@ class BundledExtentMap:
 
     def set_paths(self, path_by_phash):
         with self.pathtxn(write=True) as txn:
-            for hash, path in path_by_phash:
-                key = struct.pack('<Q', hash)
+            for hash, hashed_path in path_by_phash:
+                key = struct.pack('<Q', hashed_path)
                 if not txn.get(key):
-                    val = path.encode('UTF-8')
+                    val = hashed_path.path.encode('UTF-8')
                     txn.put(key, val)
+
+    def get_sha256_from_sha1(self, sha1: bytes) -> Optional[bytes]:
+        with self.sha1txn() as txn:
+            key = sha1
+            if val := txn.get(key):
+                return val
+
+    def set_sha256_from_sha1(self, sha1: bytes, sha256: bytes):
+        with self.sha1txn(write=True) as txn:
+            key = sha1
+            val = sha256
+            txn.put(key, val)
