@@ -342,7 +342,7 @@ def ingest_bundled(paths: Paths, store: ArtifactStore, depot: int, manifest: int
                     nd = {
                         "sha256": fhash_hex,
                         "path": path,
-                        "phash": path_hashes.ohash_by_ihash[frec.path_hash],
+                        "phash": str(path_hashes.ohash_by_ihash[frec.path_hash]),
                         "size": frec.file_size,
                     }
                     index_writer.writerow(nd)
