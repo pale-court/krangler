@@ -1,7 +1,7 @@
 from .paths import Paths
 
 
-class StateTracker():
+class StateTracker:
     def __init__(self, paths: Paths, depot: int, manifest: int):
         self.paths = paths
         self.depot = depot

@@ -1,0 +1,45 @@
+syntax = "proto2";
+
+package depot_downloader;
+
+import "google/protobuf/timestamp.proto";
+
+enum EDepotFileFlag {
+    None = 0;
+    UserConfig = 1;
+    VersionedUserConfig = 2;
+    Encrypted = 4;
+    ReadOnly = 8;
+    Hidden = 16;
+    Executable = 32;
+    Directory = 64;
+    CustomExecutable = 128;
+    InstallScript = 256;
+    Symlink = 512;
+}
+
+message ChunkData {
+    optional bytes ChunkID = 1;
+    optional bytes Checksum = 2;
+    optional uint64 Offset = 4;
+    optional uint32 CompressedLength = 5;
+    optional uint32 UncompressedLength = 6;
+}
+
+message FileData {
+    optional string FileName = 1;
+    repeated ChunkData Chunks = 2;
+    optional EDepotFileFlag Flags = 3;
+    optional uint64 TotalSize = 4;
+    optional bytes FileHash = 5;
+}
+
+message ProtoManifest {
+    repeated FileData Files = 1;
+    optional uint64 ID = 2;
+    optional google.protobuf.Timestamp CreationTime = 3;
+}
+
+message DepotConfigStore {
+    map<uint32, uint64> InstalledManifestIDs = 1;
+}
